@@ -1,6 +1,7 @@
-const API = 'https://kokoro-tts.kevyn.com.br';
-const CHATTERBOX_API = 'https://chatterbox-tts.kevyn.com.br';
-const BARK_API = 'https://bark.kevyn.com.br';
+const TTS_HOSTS = [
+  'https://tts.kevyn.com.br',
+  'https://tts-macbook.kevyn.com.br',
+];
 const QWENVL_API = 'https://qwenvl.kevyn.com.br';
 const QWENVL_MODEL = 'Qwen/Qwen2.5-VL-7B-Instruct-AWQ';
 const PDF_RENDER_MAX_SIDE = 1200;
@@ -36,11 +37,12 @@ const FILE_PAGE_PROMPT = [
   'Extract only this page. Do not mention the page number.',
 ].join(' ');
 
-const MODELS = [
-  { id: 'kokoro', label: 'Kokoro' },
-  { id: 'chatterbox', label: 'Chatterbox' },
-  { id: 'bark', label: 'Bark' },
-];
+// Backends we know how to render, keyed by the `backend` field reported by /health.
+const MODEL_META = {
+  kokoro:     { label: 'Kokoro' },
+  chatterbox: { label: 'Chatterbox' },
+};
+let MODELS = [];                // [{ id, label }] discovered at runtime
 
 // Only en and pt have voices in Kokoro; es is UI-only
 const VOICE_LANGS = [
@@ -159,9 +161,9 @@ const CHATTERBOX_FALLBACK_VOICES = [
 ];
 
 let allVoices = [];
-let barkVoices = [];
 let chatterboxVoices = [];
 let modelState = {};            // { [id]: 'loading' | 'ready' | 'offline' }
+let modelHosts = {};            // { [id]: host url currently serving that backend }
 let selectedModel = 'kokoro';
 let selectedVoice = '';
 let wavesurfer = null;
@@ -552,9 +554,39 @@ async function fetchVoicesFrom(url) {
   }
 }
 
-const fetchVoices           = () => fetchVoicesFrom(`${API}/v1/audio/voices`);
-const fetchBarkVoices       = () => fetchVoicesFrom(`${BARK_API}/voices`);
-const fetchChatterboxVoices = () => fetchVoicesFrom(`${CHATTERBOX_API}/v1/audio/voices`);
+// Ask a host which backend it currently has loaded. Returns the backend id or null.
+async function probeHost(host) {
+  try {
+    const res = await fetch(`${host}/health`, { cache: 'no-store' });
+    if (!res.ok) return null;
+    const h = await res.json();
+    if (!h || !h.backend || h.loaded !== true || h.state !== 'ready') return null;
+    return h.backend;
+  } catch {
+    return null;
+  }
+}
+
+// Probe every host and map each loaded backend to a host. Hosts are tried in
+// order, so the first one (primary) wins when both serve the same backend; the
+// other then acts as a live backup discovered on the next probe.
+async function discoverHosts() {
+  const probed = await Promise.all(
+    TTS_HOSTS.map(async host => ({ host, backend: await probeHost(host) }))
+  );
+  const map = {};
+  for (const { host, backend } of probed) {
+    if (backend && MODEL_META[backend] && !map[backend]) map[backend] = host;
+  }
+  return map;
+}
+
+// Resolve the host serving a backend, re-probing if the cached one is gone.
+async function hostForModel(id) {
+  if (modelHosts[id]) return modelHosts[id];
+  modelHosts = await discoverHosts();
+  return modelHosts[id] || null;
+}
 
 // ── Populate UI ───────────────────────────────────────────────────
 
@@ -645,25 +677,6 @@ function createWaveSurfer() {
 
 // ── Engine switching ─────────────────────────────────────────────
 
-function barkVoiceGroups() {
-  // Group bark voices by language prefix (e.g. "v2/en" → "en")
-  const groups = {};
-  barkVoices.forEach(v => {
-    const match = (typeof v === 'string' ? v : '').match(/^v2\/([a-z]{2})_/);
-    const lang = match ? match[1] : 'other';
-    (groups[lang] ||= []).push(v);
-  });
-
-  return Object.keys(groups).sort().map(lang => ({
-    label: lang.toUpperCase(),
-    // "v2/en_speaker_6" → "Speaker 6"
-    voices: groups[lang].map(v => ({
-      id: v,
-      name: capFirst(v.replace(/^v2\/[a-z]{2}_/, '').replace(/_/g, ' ')),
-    })),
-  }));
-}
-
 function chatterboxVoiceName(voiceId) {
   const parts = voiceId.split('-');
   if (parts.length < 3) return voiceId;
@@ -686,7 +699,6 @@ function chatterboxVoiceGroups(voiceLangId) {
 
 function voiceGroupsForModel() {
   const voiceLangId = document.getElementById('language').value;
-  if (selectedModel === 'bark')       return barkVoiceGroups();
   if (selectedModel === 'chatterbox') return chatterboxVoiceGroups(voiceLangId);
   return kokoroVoiceGroups(voiceLangId);
 }
@@ -697,13 +709,13 @@ function renderVoiceGrid() {
 
   const state = modelState[selectedModel];
 
-  if (state === 'offline') {
-    grid.appendChild(offlineNotice());
-    selectedVoice = '';
-    return;
-  }
   if (state === 'loading') {
     grid.innerHTML = `<p class="voice-hint">${t.loadingVoices}</p>`;
+    return;
+  }
+  if (state !== 'ready') {
+    grid.appendChild(offlineNotice());
+    selectedVoice = '';
     return;
   }
 
@@ -772,25 +784,28 @@ function setModel(id) {
   selectedModel = id;
   selectedVoice = '';
   document.querySelectorAll('#model-chips .model-chip').forEach((b, i) =>
-    b.classList.toggle('is-selected', MODELS[i].id === id));
-
-  const langField = document.getElementById('language-field');
-  const speedField = document.querySelector('.field-speed');
-  const hideLang = id === 'bark';
-  langField.style.display = hideLang ? 'none' : '';
-  if (speedField) speedField.style.display = hideLang ? 'none' : '';
+    b.classList.toggle('is-selected', MODELS[i] && MODELS[i].id === id));
 
   renderVoiceGrid();
 }
 
-async function generateBark(text, voice) {
-  const body = { text };
-  if (voice) body.voice = voice;
+function speechBody(engine, text, voice, speed, language) {
+  const body = {
+    model:           engine,
+    input:           text,
+    voice:           voice,
+    response_format: 'mp3',
+    speed:           speed,
+  };
+  if (engine === 'chatterbox') body.language = language;
+  return body;
+}
 
-  const res = await fetch(`${BARK_API}/synthesize`, {
+async function requestSpeech(host, engine, text, voice, speed, language) {
+  const res = await fetch(`${host}/v1/audio/speech`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
+    body: JSON.stringify(speechBody(engine, text, voice, speed, language)),
   });
 
   if (!res.ok) {
@@ -801,47 +816,20 @@ async function generateBark(text, voice) {
   return res.blob();
 }
 
-async function generateKokoro(text, voice, speed) {
-  const res = await fetch(`${API}/v1/audio/speech`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model:           'kokoro',
-      input:           text,
-      voice:           voice,
-      response_format: 'mp3',
-      speed:           speed,
-    }),
-  });
+// Synthesize on the host serving this backend; if it has gone away, re-probe and
+// retry once on whichever host now serves it (the backup).
+async function generateSpeech(engine, text, voice, speed, language) {
+  let host = await hostForModel(engine);
+  if (!host) throw new Error(t.offlineDesc);
 
-  if (!res.ok) {
-    const errText = await res.text().catch(() => '');
-    throw new Error(errText || `Server returned ${res.status}`);
+  try {
+    return await requestSpeech(host, engine, text, voice, speed, language);
+  } catch (err) {
+    modelHosts = await discoverHosts();
+    const backup = modelHosts[engine];
+    if (!backup || backup === host) throw err;
+    return requestSpeech(backup, engine, text, voice, speed, language);
   }
-
-  return res.blob();
-}
-
-async function generateChatterbox(text, voice, speed, language) {
-  const res = await fetch(`${CHATTERBOX_API}/v1/audio/speech`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model:           'chatterbox',
-      input:           text,
-      voice:           voice,
-      language:        language,
-      response_format: 'mp3',
-      speed:           speed,
-    }),
-  });
-
-  if (!res.ok) {
-    const errText = await res.text().catch(() => '');
-    throw new Error(errText || `Server returned ${res.status}`);
-  }
-
-  return res.blob();
 }
 
 // ── Generate ──────────────────────────────────────────────────────
@@ -873,23 +861,16 @@ async function generate() {
   btn.innerHTML = `<span class="spinner"></span><span class="btn-label">${t.generatingBtn}</span>`;
 
   try {
-    if (engine === 'bark') {
-      audioBlob = await generateBark(text, voice);
-    } else if (engine === 'chatterbox') {
-      audioBlob = await generateChatterbox(text, voice, speed, document.getElementById('language').value);
-    } else {
-      audioBlob = await generateKokoro(text, voice, speed);
-    }
+    const language = document.getElementById('language').value;
+    audioBlob = await generateSpeech(engine, text, voice, speed, language);
 
     if (audioObjectUrl) URL.revokeObjectURL(audioObjectUrl);
     audioObjectUrl = URL.createObjectURL(audioBlob);
 
-    const voiceName = engine === 'bark'
-      ? voice.replace(/^v2\//, '')
-      : engine === 'chatterbox'
-        ? chatterboxVoiceName(voice)
-        : voiceDisplayName(voice);
-    const langLabel = engine === 'bark' ? 'Bark' : (t.voiceLabels[document.getElementById('language').value] ?? '');
+    const voiceName = engine === 'chatterbox'
+      ? chatterboxVoiceName(voice)
+      : voiceDisplayName(voice);
+    const langLabel = t.voiceLabels[language] ?? '';
 
     const out = document.getElementById('output-section');
     out.hidden = true;
@@ -936,23 +917,38 @@ async function init() {
   const langSel = document.getElementById('language');
   langSel.value = uiLang === 'pt' ? 'pt' : 'en';
 
-  modelState = { kokoro: 'loading', chatterbox: 'loading', bark: 'loading' };
+  MODELS = [];
+  modelState = {};
   renderModelChips();
-  setModel(selectedModel);
+  document.getElementById('voice-grid').innerHTML =
+    `<p class="voice-hint">${t.loadingVoices}</p>`;
 
-  const [fetched, fetchedBark, fetchedChatter] = await Promise.all([
-    fetchVoices(), fetchBarkVoices(), fetchChatterboxVoices(),
-  ]);
+  modelHosts = await discoverHosts();
 
-  allVoices = fetched.voices.length ? fetched.voices : FALLBACK_VOICES;
-  barkVoices = fetchedBark.voices;
-  chatterboxVoices = fetchedChatter.voices.length ? fetchedChatter.voices : CHATTERBOX_FALLBACK_VOICES;
+  const ready = [];
+  await Promise.all(Object.keys(MODEL_META).map(async id => {
+    const host = modelHosts[id];
+    if (!host) return;
 
-  modelState.kokoro     = fetched.available ? 'ready' : 'offline';
-  modelState.bark       = fetchedBark.available ? 'ready' : 'offline';
-  modelState.chatterbox = fetchedChatter.available ? 'ready' : 'offline';
+    const { available, voices } = await fetchVoicesFrom(`${host}/v1/audio/voices`);
+    if (!available) return;
 
-  renderVoiceGrid();
+    ready.push(id);
+    if (id === 'kokoro')     allVoices        = voices.length ? voices : FALLBACK_VOICES;
+    if (id === 'chatterbox') chatterboxVoices = voices.length ? voices : CHATTERBOX_FALLBACK_VOICES;
+  }));
+
+  MODELS = Object.keys(MODEL_META)
+    .filter(id => ready.includes(id))
+    .map(id => ({ id, label: MODEL_META[id].label }));
+  modelState = Object.fromEntries(MODELS.map(m => [m.id, 'ready']));
+  renderModelChips();
+
+  if (MODELS.length) {
+    setModel(MODELS.some(m => m.id === selectedModel) ? selectedModel : MODELS[0].id);
+  } else {
+    renderVoiceGrid();
+  }
 
   langSel.addEventListener('change', renderVoiceGrid);
 
