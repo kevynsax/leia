@@ -1,6 +1,11 @@
+// Hosts are tried in order, so the first that serves a model wins; later ones
+// are live backups. `provides` pins specific models to a host whose /v1/models
+// vocabulary doesn't match ours (e.g. the OpenAI-style openaudio server);
+// hosts without it are auto-discovered via /v1/models.
 const TTS_HOSTS = [
-  'https://tts.kevyn.com.br',
-  'https://tts-macbook.kevyn.com.br',
+  { url: 'https://tts.kevyn.com.br' },
+  { url: 'https://openaudio-tts.kevyn.com.br', provides: ['openaudio'] },
+  { url: 'https://tts-macbook.kevyn.com.br' },
 ];
 const QWENVL_API = 'https://qwenvl.kevyn.com.br';
 const QWENVL_MODEL = 'Qwen/Qwen2.5-VL-7B-Instruct-AWQ';
@@ -37,12 +42,17 @@ const FILE_PAGE_PROMPT = [
   'Extract only this page. Do not mention the page number.',
 ].join(' ');
 
-// Backends we know how to render, keyed by the model id from /v1/models.
-// `style` picks the voice grouper/name logic ('kokoro' prefixes vs 'edge' locale ids).
+const OPENAI_VOICES = ['alloy', 'echo', 'fable', 'onyx', 'nova', 'shimmer'];
+
+// Backends we know how to render, keyed by our model id.
+// `style` picks the voice grouper/name logic:
+//   'kokoro' → prefix ids (af_…), 'edge' → locale ids (pt-BR-…Neural), 'flat' → plain names.
+// `requestModel` overrides the id sent in the speech request (host vocabulary differs).
+// `voices` pins a fixed voice list for hosts without a /v1/audio/voices endpoint.
 const MODEL_META = {
   kokoro:     { label: 'Kokoro',     style: 'kokoro' },
   chatterbox: { label: 'Chatterbox', style: 'edge' },
-  openaudio:  { label: 'OpenAudio',  style: 'edge' },
+  openaudio:  { label: 'OpenAudio',  style: 'flat', requestModel: 'tts-1', voices: OPENAI_VOICES },
 };
 let MODELS = [];                // [{ id, label }] discovered at runtime
 
@@ -540,29 +550,37 @@ async function handleUpload(file) {
 
 // ── Backend discovery ─────────────────────────────────────────────
 
-// Ask a host which backends it can serve (each is loaded on demand per request).
+// Resolve which of our models a host serves. `provides` hosts are taken at their
+// word once reachable; others are auto-discovered from /v1/models.
 async function probeHost(host) {
   try {
-    const res = await fetch(`${host}/v1/models`, { cache: 'no-store' });
+    const res = await fetch(`${host.url}/v1/models`, { cache: 'no-store' });
     if (!res.ok) return [];
+    if (host.provides) return host.provides;
     const j = await res.json();
-    return Array.isArray(j.data) ? j.data.map(m => m.id).filter(Boolean) : [];
+    const ids = Array.isArray(j.data) ? j.data.map(m => m.id) : [];
+    return ids.filter(id => MODEL_META[id]);
   } catch {
     return [];
   }
 }
 
-// Probe every host and map each serveable backend to a host. Hosts are tried in
-// order, so the first one (primary) wins when both serve the same backend; the
-// other then acts as a live backup discovered on the next probe.
+// Probe every host and map each serveable model to a host url. Hosts are tried in
+// order, so the first one wins when several serve the same model; the others then
+// act as live backups discovered on the next probe. Models pinned to a `provides`
+// host are never auto-claimed elsewhere, since their request/voice vocabulary is
+// host-specific.
 async function discoverHosts() {
+  const pinned = new Set(TTS_HOSTS.flatMap(h => h.provides || []));
   const probed = await Promise.all(
     TTS_HOSTS.map(async host => ({ host, ids: await probeHost(host) }))
   );
   const map = {};
   for (const { host, ids } of probed) {
     for (const id of ids) {
-      if (MODEL_META[id] && !map[id]) map[id] = host;
+      if (!MODEL_META[id] || map[id]) continue;
+      if (pinned.has(id) && !(host.provides || []).includes(id)) continue;
+      map[id] = host.url;
     }
   }
   return map;
@@ -676,11 +694,16 @@ function createWaveSurfer() {
 
 // ── Engine switching ─────────────────────────────────────────────
 
-// Edge-style locale voice ids (e.g. "pt-BR-AntonioNeural"), shared by chatterbox and openaudio.
+// Edge-style locale voice ids (e.g. "pt-BR-AntonioNeural"), used by chatterbox.
 function edgeVoiceName(voiceId) {
   const parts = voiceId.split('-');
   if (parts.length < 3) return voiceId;
   return parts.slice(2).join('-').replace(/(Multilingual)?Neural$/i, '');
+}
+
+// Flat, language-agnostic voice names (e.g. "alloy"), used by openaudio.
+function flatVoiceGroups(voices) {
+  return [{ label: t.voice, voices: voices.map(v => ({ id: v, name: capFirst(v) })) }];
 }
 
 function edgeVoiceGroups(voiceLangId, allVoices) {
@@ -698,9 +721,11 @@ function edgeVoiceGroups(voiceLangId, allVoices) {
 }
 
 function voiceGroupsForModel() {
-  const voiceLangId = document.getElementById('language').value;
+  const style = MODEL_META[selectedModel]?.style;
   const voices = modelVoices[selectedModel] || [];
-  if (MODEL_META[selectedModel]?.style === 'edge') return edgeVoiceGroups(voiceLangId, voices);
+  if (style === 'flat') return flatVoiceGroups(voices);
+  const voiceLangId = document.getElementById('language').value;
+  if (style === 'edge') return edgeVoiceGroups(voiceLangId, voices);
   return kokoroVoiceGroups(voiceLangId, voices);
 }
 
@@ -787,12 +812,17 @@ function setModel(id) {
   document.querySelectorAll('#model-chips .model-chip').forEach((b, i) =>
     b.classList.toggle('is-selected', MODELS[i] && MODELS[i].id === id));
 
+  // Flat-style models (e.g. openaudio) have language-agnostic voices.
+  const hideLang = MODEL_META[id]?.style === 'flat';
+  const langField = document.getElementById('language-field');
+  if (langField) langField.style.display = hideLang ? 'none' : '';
+
   renderVoiceGrid();
 }
 
 function speechBody(engine, text, voice, speed, language) {
   const body = {
-    model:           engine,
+    model:           MODEL_META[engine]?.requestModel || engine,
     input:           text,
     voice:           voice,
     response_format: 'mp3',
@@ -868,10 +898,13 @@ async function generate() {
     if (audioObjectUrl) URL.revokeObjectURL(audioObjectUrl);
     audioObjectUrl = URL.createObjectURL(audioBlob);
 
-    const voiceName = MODEL_META[engine]?.style === 'edge'
-      ? edgeVoiceName(voice)
+    const style = MODEL_META[engine]?.style;
+    const voiceName = style === 'edge' ? edgeVoiceName(voice)
+      : style === 'flat' ? capFirst(voice)
       : voiceDisplayName(voice);
-    const langLabel = t.voiceLabels[language] ?? '';
+    const langLabel = style === 'flat'
+      ? (MODEL_META[engine]?.label ?? '')
+      : (t.voiceLabels[language] ?? '');
 
     const out = document.getElementById('output-section');
     out.hidden = true;
@@ -928,6 +961,7 @@ async function init() {
 
   modelVoices = {};
   await Promise.all(Object.keys(modelHosts).map(async id => {
+    if (MODEL_META[id].voices) { modelVoices[id] = MODEL_META[id].voices; return; }
     const voices = await fetchModelVoices(modelHosts[id], id);
     modelVoices[id] = voices.length ? voices : (FALLBACK_BY_STYLE[MODEL_META[id].style] || []);
   }));
