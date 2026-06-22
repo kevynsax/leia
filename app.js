@@ -36,6 +36,12 @@ const FILE_PAGE_PROMPT = [
   'Extract only this page. Do not mention the page number.',
 ].join(' ');
 
+const MODELS = [
+  { id: 'kokoro', label: 'Kokoro' },
+  { id: 'chatterbox', label: 'Chatterbox' },
+  { id: 'bark', label: 'Bark' },
+];
+
 // Only en and pt have voices in Kokoro; es is UI-only
 const VOICE_LANGS = [
   { id: 'en', prefixes: ['af', 'am', 'bf', 'bm', 'ef', 'em'] },
@@ -44,9 +50,13 @@ const VOICE_LANGS = [
 
 const T = {
   en: {
-    engine:       'Engine',
+    model:        'Model',
     language:     'Language',
     voice:        'Voice',
+    offline:      'This model is offline',
+    offlineDesc:  'The server isn’t reachable right now (it may be a laptop that’s turned off). Try again later or pick another model.',
+    loadingVoices:'Checking model…',
+    noVoices:     'No voices for this model and language.',
     speed:        'Speed',
     text:         'Text',
     placeholder:  'Enter the text you want to convert to speech…',
@@ -70,9 +80,13 @@ const T = {
     voiceLabels:  { en: 'English', pt: 'Portuguese' },
   },
   pt: {
-    engine:       'Motor',
+    model:        'Modelo',
     language:     'Idioma',
     voice:        'Voz',
+    offline:      'Este modelo está offline',
+    offlineDesc:  'O servidor não está acessível no momento (pode ser um laptop desligado). Tente mais tarde ou escolha outro modelo.',
+    loadingVoices:'Verificando modelo…',
+    noVoices:     'Nenhuma voz para este modelo e idioma.',
     speed:        'Velocidade',
     text:         'Texto',
     placeholder:  'Digite o texto que deseja converter em áudio…',
@@ -96,9 +110,13 @@ const T = {
     voiceLabels:  { en: 'Inglês', pt: 'Português' },
   },
   es: {
-    engine:       'Motor',
+    model:        'Modelo',
     language:     'Idioma',
     voice:        'Voz',
+    offline:      'Este modelo está sin conexión',
+    offlineDesc:  'El servidor no está accesible ahora mismo (puede ser un portátil apagado). Inténtalo más tarde o elige otro modelo.',
+    loadingVoices:'Comprobando modelo…',
+    noVoices:     'No hay voces para este modelo e idioma.',
     speed:        'Velocidad',
     text:         'Texto',
     placeholder:  'Ingresa el texto que deseas convertir a audio…',
@@ -143,6 +161,9 @@ const CHATTERBOX_FALLBACK_VOICES = [
 let allVoices = [];
 let barkVoices = [];
 let chatterboxVoices = [];
+let modelState = {};            // { [id]: 'loading' | 'ready' | 'offline' }
+let selectedModel = 'kokoro';
+let selectedVoice = '';
 let wavesurfer = null;
 let audioBlob = null;
 let audioObjectUrl = null;
@@ -387,7 +408,7 @@ function selectDetectedLanguage(language) {
   if (!supported || langSel.value === langCode) return;
 
   langSel.value = langCode;
-  populateVoicesForEngine();
+  renderVoiceGrid();
 }
 
 async function requestQwenExtraction(content) {
@@ -514,47 +535,26 @@ async function handleUpload(file) {
 
 // ── Voice fetching ────────────────────────────────────────────────
 
-async function fetchVoices() {
+function parseVoiceList(data) {
+  if (Array.isArray(data))        return data;
+  if (Array.isArray(data.voices)) return data.voices;
+  if (Array.isArray(data.data))   return data.data;
+  return [];
+}
+
+async function fetchVoicesFrom(url) {
   try {
-    const res = await fetch(`${API}/v1/audio/voices`);
+    const res = await fetch(url);
     if (!res.ok) throw new Error('HTTP ' + res.status);
-    const data = await res.json();
-    if (Array.isArray(data))        return data;
-    if (Array.isArray(data.voices)) return data.voices;
-    if (Array.isArray(data.data))   return data.data;
-    return [];
+    return { available: true, voices: parseVoiceList(await res.json()) };
   } catch {
-    return [];
+    return { available: false, voices: [] };
   }
 }
 
-async function fetchBarkVoices() {
-  try {
-    const res = await fetch(`${BARK_API}/voices`);
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    const data = await res.json();
-    if (Array.isArray(data))        return data;
-    if (Array.isArray(data.voices)) return data.voices;
-    if (Array.isArray(data.data))   return data.data;
-    return [];
-  } catch {
-    return [];
-  }
-}
-
-async function fetchChatterboxVoices() {
-  try {
-    const res = await fetch(`${CHATTERBOX_API}/v1/audio/voices`);
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    const data = await res.json();
-    if (Array.isArray(data))        return data;
-    if (Array.isArray(data.voices)) return data.voices;
-    if (Array.isArray(data.data))   return data.data;
-    return [];
-  } catch {
-    return [];
-  }
-}
+const fetchVoices           = () => fetchVoicesFrom(`${API}/v1/audio/voices`);
+const fetchBarkVoices       = () => fetchVoicesFrom(`${BARK_API}/voices`);
+const fetchChatterboxVoices = () => fetchVoicesFrom(`${CHATTERBOX_API}/v1/audio/voices`);
 
 // ── Populate UI ───────────────────────────────────────────────────
 
@@ -565,34 +565,21 @@ function populateLanguages() {
   ).join('');
 }
 
-function populateVoices(voiceLangId) {
+function kokoroVoiceGroups(voiceLangId) {
   const lang = VOICE_LANGS.find(l => l.id === voiceLangId);
-  if (!lang) return;
+  if (!lang) return [];
 
   const fPfx = lang.prefixes.filter(p => p[1] === 'f');
   const mPfx = lang.prefixes.filter(p => p[1] === 'm');
 
-  const fVoices = allVoices.filter(v => fPfx.some(p => v.startsWith(p + '_')));
-  const mVoices = allVoices.filter(v => mPfx.some(p => v.startsWith(p + '_')));
+  const byPfx = pfx => allVoices
+    .filter(v => pfx.some(p => v.startsWith(p + '_')))
+    .map(v => ({ id: v, name: voiceDisplayName(v) }));
 
-  const sel = document.getElementById('voice');
-  sel.innerHTML = '';
-
-  function addGroup(label, voices) {
-    if (!voices.length) return;
-    const grp = document.createElement('optgroup');
-    grp.label = label;
-    voices.forEach(v => {
-      const opt = document.createElement('option');
-      opt.value = v;
-      opt.textContent = voiceDisplayName(v);
-      grp.appendChild(opt);
-    });
-    sel.appendChild(grp);
-  }
-
-  addGroup(t.genderF, fVoices);
-  addGroup(t.genderM, mVoices);
+  return [
+    { label: t.genderF, voices: byPfx(fPfx) },
+    { label: t.genderM, voices: byPfx(mPfx) },
+  ];
 }
 
 // ── WaveSurfer ────────────────────────────────────────────────────
@@ -658,32 +645,23 @@ function createWaveSurfer() {
 
 // ── Engine switching ─────────────────────────────────────────────
 
-function populateBarkVoices() {
-  const sel = document.getElementById('voice');
-  sel.innerHTML = '';
-
+function barkVoiceGroups() {
   // Group bark voices by language prefix (e.g. "v2/en" → "en")
   const groups = {};
   barkVoices.forEach(v => {
     const match = (typeof v === 'string' ? v : '').match(/^v2\/([a-z]{2})_/);
     const lang = match ? match[1] : 'other';
-    if (!groups[lang]) groups[lang] = [];
-    groups[lang].push(v);
+    (groups[lang] ||= []).push(v);
   });
 
-  Object.keys(groups).sort().forEach(lang => {
-    const grp = document.createElement('optgroup');
-    grp.label = lang.toUpperCase();
-    groups[lang].forEach(v => {
-      const opt = document.createElement('option');
-      opt.value = v;
-      // "v2/en_speaker_6" → "Speaker 6"
-      const name = v.replace(/^v2\/[a-z]{2}_/, '').replace(/_/g, ' ');
-      opt.textContent = capFirst(name);
-      grp.appendChild(opt);
-    });
-    sel.appendChild(grp);
-  });
+  return Object.keys(groups).sort().map(lang => ({
+    label: lang.toUpperCase(),
+    // "v2/en_speaker_6" → "Speaker 6"
+    voices: groups[lang].map(v => ({
+      id: v,
+      name: capFirst(v.replace(/^v2\/[a-z]{2}_/, '').replace(/_/g, ' ')),
+    })),
+  }));
 }
 
 function chatterboxVoiceName(voiceId) {
@@ -692,10 +670,7 @@ function chatterboxVoiceName(voiceId) {
   return parts.slice(2).join('-').replace(/(Multilingual)?Neural$/i, '');
 }
 
-function populateChatterboxVoices(voiceLangId) {
-  const sel = document.getElementById('voice');
-  sel.innerHTML = '';
-
+function chatterboxVoiceGroups(voiceLangId) {
   const voices = chatterboxVoices.filter(v => v.startsWith(voiceLangId + '-'));
   const groups = {};
   voices.forEach(v => {
@@ -703,36 +678,109 @@ function populateChatterboxVoices(voiceLangId) {
     (groups[region] ||= []).push(v);
   });
 
-  Object.keys(groups).sort().forEach(region => {
-    const grp = document.createElement('optgroup');
-    grp.label = region;
-    groups[region].forEach(v => {
-      const opt = document.createElement('option');
-      opt.value = v;
-      opt.textContent = chatterboxVoiceName(v);
-      grp.appendChild(opt);
+  return Object.keys(groups).sort().map(region => ({
+    label: region,
+    voices: groups[region].map(v => ({ id: v, name: chatterboxVoiceName(v) })),
+  }));
+}
+
+function voiceGroupsForModel() {
+  const voiceLangId = document.getElementById('language').value;
+  if (selectedModel === 'bark')       return barkVoiceGroups();
+  if (selectedModel === 'chatterbox') return chatterboxVoiceGroups(voiceLangId);
+  return kokoroVoiceGroups(voiceLangId);
+}
+
+function renderVoiceGrid() {
+  const grid = document.getElementById('voice-grid');
+  grid.innerHTML = '';
+
+  const state = modelState[selectedModel];
+
+  if (state === 'offline') {
+    grid.appendChild(offlineNotice());
+    selectedVoice = '';
+    return;
+  }
+  if (state === 'loading') {
+    grid.innerHTML = `<p class="voice-hint">${t.loadingVoices}</p>`;
+    return;
+  }
+
+  const groups = voiceGroupsForModel().filter(g => g.voices.length);
+  if (!groups.length) {
+    grid.innerHTML = `<p class="voice-hint">${t.noVoices}</p>`;
+    selectedVoice = '';
+    return;
+  }
+
+  const ids = groups.flatMap(g => g.voices.map(v => v.id));
+  if (!ids.includes(selectedVoice)) selectedVoice = ids[0];
+
+  groups.forEach(group => {
+    const label = document.createElement('p');
+    label.className = 'voice-group-label';
+    label.textContent = group.label;
+    grid.appendChild(label);
+
+    const row = document.createElement('div');
+    row.className = 'voice-options';
+    group.voices.forEach(v => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'voice-chip' + (v.id === selectedVoice ? ' is-selected' : '');
+      btn.textContent = v.name;
+      btn.dataset.voice = v.id;
+      btn.addEventListener('click', () => {
+        selectedVoice = v.id;
+        grid.querySelectorAll('.voice-chip').forEach(b =>
+          b.classList.toggle('is-selected', b.dataset.voice === v.id));
+      });
+      row.appendChild(btn);
     });
-    sel.appendChild(grp);
+    grid.appendChild(row);
   });
 }
 
-function populateVoicesForEngine() {
-  const engine = document.getElementById('engine').value;
-  const voiceLangId = document.getElementById('language').value;
-  if (engine === 'bark') populateBarkVoices();
-  else if (engine === 'chatterbox') populateChatterboxVoices(voiceLangId);
-  else populateVoices(voiceLangId);
+function offlineNotice() {
+  const box = document.createElement('div');
+  box.className = 'offline-notice';
+  const title = document.createElement('p');
+  title.className = 'offline-title';
+  title.textContent = t.offline;
+  const desc = document.createElement('p');
+  desc.className = 'offline-desc';
+  desc.textContent = t.offlineDesc;
+  box.append(title, desc);
+  return box;
 }
 
-function updateEngineUI() {
-  const engine = document.getElementById('engine').value;
+function renderModelChips() {
+  const wrap = document.getElementById('model-chips');
+  wrap.innerHTML = '';
+  MODELS.forEach(m => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'model-chip' + (m.id === selectedModel ? ' is-selected' : '');
+    btn.textContent = m.label;
+    btn.addEventListener('click', () => setModel(m.id));
+    wrap.appendChild(btn);
+  });
+}
+
+function setModel(id) {
+  selectedModel = id;
+  selectedVoice = '';
+  document.querySelectorAll('#model-chips .model-chip').forEach((b, i) =>
+    b.classList.toggle('is-selected', MODELS[i].id === id));
+
   const langField = document.getElementById('language-field');
   const speedField = document.querySelector('.field-speed');
-  const hideLang = engine === 'bark';
-
+  const hideLang = id === 'bark';
   langField.style.display = hideLang ? 'none' : '';
   if (speedField) speedField.style.display = hideLang ? 'none' : '';
-  populateVoicesForEngine();
+
+  renderVoiceGrid();
 }
 
 async function generateBark(text, voice) {
@@ -810,8 +858,8 @@ function restoreBtn(btn) {
 
 async function generate() {
   const text   = document.getElementById('text').value.trim();
-  const engine = document.getElementById('engine').value;
-  const voice  = document.getElementById('voice').value;
+  const engine = selectedModel;
+  const voice  = selectedVoice;
   const speed  = parseFloat(document.getElementById('speed').value);
   const btn    = document.getElementById('generate-btn');
 
@@ -888,22 +936,25 @@ async function init() {
   const langSel = document.getElementById('language');
   langSel.value = uiLang === 'pt' ? 'pt' : 'en';
 
+  modelState = { kokoro: 'loading', chatterbox: 'loading', bark: 'loading' };
+  renderModelChips();
+  setModel(selectedModel);
+
   const [fetched, fetchedBark, fetchedChatter] = await Promise.all([
     fetchVoices(), fetchBarkVoices(), fetchChatterboxVoices(),
   ]);
-  allVoices = fetched.length ? fetched : FALLBACK_VOICES;
-  barkVoices = fetchedBark;
-  chatterboxVoices = fetchedChatter.length ? fetchedChatter : CHATTERBOX_FALLBACK_VOICES;
 
-  populateVoices(langSel.value);
+  allVoices = fetched.voices.length ? fetched.voices : FALLBACK_VOICES;
+  barkVoices = fetchedBark.voices;
+  chatterboxVoices = fetchedChatter.voices.length ? fetchedChatter.voices : CHATTERBOX_FALLBACK_VOICES;
 
-  langSel.addEventListener('change', () => {
-    populateVoicesForEngine();
-  });
+  modelState.kokoro     = fetched.available ? 'ready' : 'offline';
+  modelState.bark       = fetchedBark.available ? 'ready' : 'offline';
+  modelState.chatterbox = fetchedChatter.available ? 'ready' : 'offline';
 
-  const engineSel = document.getElementById('engine');
-  engineSel.addEventListener('change', updateEngineUI);
-  updateEngineUI();
+  renderVoiceGrid();
+
+  langSel.addEventListener('change', renderVoiceGrid);
 
   const speedEl = document.getElementById('speed');
   function updateSpeedBadge() {
