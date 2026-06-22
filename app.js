@@ -37,10 +37,12 @@ const FILE_PAGE_PROMPT = [
   'Extract only this page. Do not mention the page number.',
 ].join(' ');
 
-// Backends we know how to render, keyed by the `backend` field reported by /health.
+// Backends we know how to render, keyed by the model id from /v1/models.
+// `style` picks the voice grouper/name logic ('kokoro' prefixes vs 'edge' locale ids).
 const MODEL_META = {
-  kokoro:     { label: 'Kokoro' },
-  chatterbox: { label: 'Chatterbox' },
+  kokoro:     { label: 'Kokoro',     style: 'kokoro' },
+  chatterbox: { label: 'Chatterbox', style: 'edge' },
+  openaudio:  { label: 'OpenAudio',  style: 'edge' },
 };
 let MODELS = [];                // [{ id, label }] discovered at runtime
 
@@ -160,8 +162,9 @@ const CHATTERBOX_FALLBACK_VOICES = [
   'pt-PT-RaquelNeural','pt-PT-DuarteNeural',
 ];
 
-let allVoices = [];
-let chatterboxVoices = [];
+const FALLBACK_BY_STYLE = { kokoro: FALLBACK_VOICES, edge: CHATTERBOX_FALLBACK_VOICES };
+
+let modelVoices = {};           // { [id]: string[] } voices fetched per model
 let modelState = {};            // { [id]: 'loading' | 'ready' | 'offline' }
 let modelHosts = {};            // { [id]: host url currently serving that backend }
 let selectedModel = 'kokoro';
@@ -535,50 +538,46 @@ async function handleUpload(file) {
   }
 }
 
-// ── Voice fetching ────────────────────────────────────────────────
+// ── Backend discovery ─────────────────────────────────────────────
 
-function parseVoiceList(data) {
-  if (Array.isArray(data))        return data;
-  if (Array.isArray(data.voices)) return data.voices;
-  if (Array.isArray(data.data))   return data.data;
-  return [];
-}
-
-async function fetchVoicesFrom(url) {
-  try {
-    const res = await fetch(url);
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    return { available: true, voices: parseVoiceList(await res.json()) };
-  } catch {
-    return { available: false, voices: [] };
-  }
-}
-
-// Ask a host which backend it currently has loaded. Returns the backend id or null.
+// Ask a host which backends it can serve (each is loaded on demand per request).
 async function probeHost(host) {
   try {
-    const res = await fetch(`${host}/health`, { cache: 'no-store' });
-    if (!res.ok) return null;
-    const h = await res.json();
-    if (!h || !h.backend || h.loaded !== true || h.state !== 'ready') return null;
-    return h.backend;
+    const res = await fetch(`${host}/v1/models`, { cache: 'no-store' });
+    if (!res.ok) return [];
+    const j = await res.json();
+    return Array.isArray(j.data) ? j.data.map(m => m.id).filter(Boolean) : [];
   } catch {
-    return null;
+    return [];
   }
 }
 
-// Probe every host and map each loaded backend to a host. Hosts are tried in
+// Probe every host and map each serveable backend to a host. Hosts are tried in
 // order, so the first one (primary) wins when both serve the same backend; the
 // other then acts as a live backup discovered on the next probe.
 async function discoverHosts() {
   const probed = await Promise.all(
-    TTS_HOSTS.map(async host => ({ host, backend: await probeHost(host) }))
+    TTS_HOSTS.map(async host => ({ host, ids: await probeHost(host) }))
   );
   const map = {};
-  for (const { host, backend } of probed) {
-    if (backend && MODEL_META[backend] && !map[backend]) map[backend] = host;
+  for (const { host, ids } of probed) {
+    for (const id of ids) {
+      if (MODEL_META[id] && !map[id]) map[id] = host;
+    }
   }
   return map;
+}
+
+// Fetch the voice list a host exposes for a specific model.
+async function fetchModelVoices(host, id) {
+  try {
+    const res = await fetch(`${host}/v1/audio/voices?model=${encodeURIComponent(id)}`, { cache: 'no-store' });
+    if (!res.ok) return [];
+    const j = await res.json();
+    return Array.isArray(j.voices) ? j.voices : [];
+  } catch {
+    return [];
+  }
 }
 
 // Resolve the host serving a backend, re-probing if the cached one is gone.
@@ -597,14 +596,14 @@ function populateLanguages() {
   ).join('');
 }
 
-function kokoroVoiceGroups(voiceLangId) {
+function kokoroVoiceGroups(voiceLangId, voices) {
   const lang = VOICE_LANGS.find(l => l.id === voiceLangId);
   if (!lang) return [];
 
   const fPfx = lang.prefixes.filter(p => p[1] === 'f');
   const mPfx = lang.prefixes.filter(p => p[1] === 'm');
 
-  const byPfx = pfx => allVoices
+  const byPfx = pfx => voices
     .filter(v => pfx.some(p => v.startsWith(p + '_')))
     .map(v => ({ id: v, name: voiceDisplayName(v) }));
 
@@ -677,14 +676,15 @@ function createWaveSurfer() {
 
 // ── Engine switching ─────────────────────────────────────────────
 
-function chatterboxVoiceName(voiceId) {
+// Edge-style locale voice ids (e.g. "pt-BR-AntonioNeural"), shared by chatterbox and openaudio.
+function edgeVoiceName(voiceId) {
   const parts = voiceId.split('-');
   if (parts.length < 3) return voiceId;
   return parts.slice(2).join('-').replace(/(Multilingual)?Neural$/i, '');
 }
 
-function chatterboxVoiceGroups(voiceLangId) {
-  const voices = chatterboxVoices.filter(v => v.startsWith(voiceLangId + '-'));
+function edgeVoiceGroups(voiceLangId, allVoices) {
+  const voices = allVoices.filter(v => v.startsWith(voiceLangId + '-'));
   const groups = {};
   voices.forEach(v => {
     const region = v.split('-')[1] || 'other';
@@ -693,14 +693,15 @@ function chatterboxVoiceGroups(voiceLangId) {
 
   return Object.keys(groups).sort().map(region => ({
     label: region,
-    voices: groups[region].map(v => ({ id: v, name: chatterboxVoiceName(v) })),
+    voices: groups[region].map(v => ({ id: v, name: edgeVoiceName(v) })),
   }));
 }
 
 function voiceGroupsForModel() {
   const voiceLangId = document.getElementById('language').value;
-  if (selectedModel === 'chatterbox') return chatterboxVoiceGroups(voiceLangId);
-  return kokoroVoiceGroups(voiceLangId);
+  const voices = modelVoices[selectedModel] || [];
+  if (MODEL_META[selectedModel]?.style === 'edge') return edgeVoiceGroups(voiceLangId, voices);
+  return kokoroVoiceGroups(voiceLangId, voices);
 }
 
 function renderVoiceGrid() {
@@ -797,7 +798,7 @@ function speechBody(engine, text, voice, speed, language) {
     response_format: 'mp3',
     speed:           speed,
   };
-  if (engine === 'chatterbox') body.language = language;
+  if (MODEL_META[engine]?.style === 'edge') body.language = language;
   return body;
 }
 
@@ -867,8 +868,8 @@ async function generate() {
     if (audioObjectUrl) URL.revokeObjectURL(audioObjectUrl);
     audioObjectUrl = URL.createObjectURL(audioBlob);
 
-    const voiceName = engine === 'chatterbox'
-      ? chatterboxVoiceName(voice)
+    const voiceName = MODEL_META[engine]?.style === 'edge'
+      ? edgeVoiceName(voice)
       : voiceDisplayName(voice);
     const langLabel = t.voiceLabels[language] ?? '';
 
@@ -925,21 +926,14 @@ async function init() {
 
   modelHosts = await discoverHosts();
 
-  const ready = [];
-  await Promise.all(Object.keys(MODEL_META).map(async id => {
-    const host = modelHosts[id];
-    if (!host) return;
-
-    const { available, voices } = await fetchVoicesFrom(`${host}/v1/audio/voices`);
-    if (!available) return;
-
-    ready.push(id);
-    if (id === 'kokoro')     allVoices        = voices.length ? voices : FALLBACK_VOICES;
-    if (id === 'chatterbox') chatterboxVoices = voices.length ? voices : CHATTERBOX_FALLBACK_VOICES;
+  modelVoices = {};
+  await Promise.all(Object.keys(modelHosts).map(async id => {
+    const voices = await fetchModelVoices(modelHosts[id], id);
+    modelVoices[id] = voices.length ? voices : (FALLBACK_BY_STYLE[MODEL_META[id].style] || []);
   }));
 
   MODELS = Object.keys(MODEL_META)
-    .filter(id => ready.includes(id))
+    .filter(id => modelHosts[id])
     .map(id => ({ id, label: MODEL_META[id].label }));
   modelState = Object.fromEntries(MODELS.map(m => [m.id, 'ready']));
   renderModelChips();
