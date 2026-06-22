@@ -1,4 +1,5 @@
-const API = 'https://tts.kevyn.com.br';
+const API = 'https://kokoro-tts.kevyn.com.br';
+const BARK_API = 'https://bark.kevyn.com.br';
 const QWENVL_API = 'https://qwenvl.kevyn.com.br';
 const QWENVL_MODEL = 'Qwen/Qwen2.5-VL-7B-Instruct-AWQ';
 const PDF_RENDER_MAX_SIDE = 1200;
@@ -42,6 +43,7 @@ const VOICE_LANGS = [
 
 const T = {
   en: {
+    engine:       'Engine',
     language:     'Language',
     voice:        'Voice',
     speed:        'Speed',
@@ -67,6 +69,7 @@ const T = {
     voiceLabels:  { en: 'English', pt: 'Portuguese' },
   },
   pt: {
+    engine:       'Motor',
     language:     'Idioma',
     voice:        'Voz',
     speed:        'Velocidade',
@@ -92,6 +95,7 @@ const T = {
     voiceLabels:  { en: 'Inglês', pt: 'Português' },
   },
   es: {
+    engine:       'Motor',
     language:     'Idioma',
     voice:        'Voz',
     speed:        'Velocidad',
@@ -129,6 +133,7 @@ const FALLBACK_VOICES = [
 ];
 
 let allVoices = [];
+let barkVoices = [];
 let wavesurfer = null;
 let audioBlob = null;
 let audioObjectUrl = null;
@@ -514,6 +519,20 @@ async function fetchVoices() {
   }
 }
 
+async function fetchBarkVoices() {
+  try {
+    const res = await fetch(`${BARK_API}/voices`);
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+    if (Array.isArray(data))        return data;
+    if (Array.isArray(data.voices)) return data.voices;
+    if (Array.isArray(data.data))   return data.data;
+    return [];
+  } catch {
+    return [];
+  }
+}
+
 // ── Populate UI ───────────────────────────────────────────────────
 
 function populateLanguages() {
@@ -614,6 +633,91 @@ function createWaveSurfer() {
   });
 }
 
+// ── Engine switching ─────────────────────────────────────────────
+
+function populateBarkVoices() {
+  const sel = document.getElementById('voice');
+  sel.innerHTML = '';
+
+  // Group bark voices by language prefix (e.g. "v2/en" → "en")
+  const groups = {};
+  barkVoices.forEach(v => {
+    const match = (typeof v === 'string' ? v : '').match(/^v2\/([a-z]{2})_/);
+    const lang = match ? match[1] : 'other';
+    if (!groups[lang]) groups[lang] = [];
+    groups[lang].push(v);
+  });
+
+  Object.keys(groups).sort().forEach(lang => {
+    const grp = document.createElement('optgroup');
+    grp.label = lang.toUpperCase();
+    groups[lang].forEach(v => {
+      const opt = document.createElement('option');
+      opt.value = v;
+      // "v2/en_speaker_6" → "Speaker 6"
+      const name = v.replace(/^v2\/[a-z]{2}_/, '').replace(/_/g, ' ');
+      opt.textContent = capFirst(name);
+      grp.appendChild(opt);
+    });
+    sel.appendChild(grp);
+  });
+}
+
+function updateEngineUI() {
+  const engine = document.getElementById('engine').value;
+  const langField = document.getElementById('language-field');
+  const speedField = document.querySelector('.field-speed');
+
+  if (engine === 'bark') {
+    langField.style.display = 'none';
+    if (speedField) speedField.style.display = 'none';
+    populateBarkVoices();
+  } else {
+    langField.style.display = '';
+    if (speedField) speedField.style.display = '';
+    populateVoices(document.getElementById('language').value);
+  }
+}
+
+async function generateBark(text, voice) {
+  const body = { text };
+  if (voice) body.voice = voice;
+
+  const res = await fetch(`${BARK_API}/synthesize`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const errText = await res.text().catch(() => '');
+    throw new Error(errText || `Server returned ${res.status}`);
+  }
+
+  return res.blob();
+}
+
+async function generateKokoro(text, voice, speed) {
+  const res = await fetch(`${API}/v1/audio/speech`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model:           'kokoro',
+      input:           text,
+      voice:           voice,
+      response_format: 'mp3',
+      speed:           speed,
+    }),
+  });
+
+  if (!res.ok) {
+    const errText = await res.text().catch(() => '');
+    throw new Error(errText || `Server returned ${res.status}`);
+  }
+
+  return res.blob();
+}
+
 // ── Generate ──────────────────────────────────────────────────────
 
 function restoreBtn(btn) {
@@ -627,12 +731,13 @@ function restoreBtn(btn) {
 }
 
 async function generate() {
-  const text  = document.getElementById('text').value.trim();
-  const voice = document.getElementById('voice').value;
-  const speed = parseFloat(document.getElementById('speed').value);
-  const btn   = document.getElementById('generate-btn');
+  const text   = document.getElementById('text').value.trim();
+  const engine = document.getElementById('engine').value;
+  const voice  = document.getElementById('voice').value;
+  const speed  = parseFloat(document.getElementById('speed').value);
+  const btn    = document.getElementById('generate-btn');
 
-  if (!text)  { showError(t.errEmpty); return; }
+  if (!text) { showError(t.errEmpty); return; }
   if (!voice) { showError(t.errVoice); return; }
 
   document.getElementById('error-toast').hidden = true;
@@ -642,30 +747,17 @@ async function generate() {
   btn.innerHTML = `<span class="spinner"></span><span class="btn-label">${t.generatingBtn}</span>`;
 
   try {
-    const res = await fetch(`${API}/v1/audio/speech`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model:           'kokoro',
-        input:           text,
-        voice:           voice,
-        response_format: 'mp3',
-        speed:           speed,
-      }),
-    });
-
-    if (!res.ok) {
-      const errText = await res.text().catch(() => '');
-      throw new Error(errText || `Server returned ${res.status}`);
+    if (engine === 'bark') {
+      audioBlob = await generateBark(text, voice);
+    } else {
+      audioBlob = await generateKokoro(text, voice, speed);
     }
-
-    audioBlob = await res.blob();
 
     if (audioObjectUrl) URL.revokeObjectURL(audioObjectUrl);
     audioObjectUrl = URL.createObjectURL(audioBlob);
 
-    const voiceName = voiceDisplayName(voice);
-    const langLabel = t.voiceLabels[document.getElementById('language').value] ?? '';
+    const voiceName = engine === 'bark' ? voice.replace(/^v2\//, '') : voiceDisplayName(voice);
+    const langLabel = engine === 'bark' ? 'Bark' : (t.voiceLabels[document.getElementById('language').value] ?? '');
 
     const out = document.getElementById('output-section');
     out.hidden = true;
@@ -712,14 +804,19 @@ async function init() {
   const langSel = document.getElementById('language');
   langSel.value = uiLang === 'pt' ? 'pt' : 'en';
 
-  const fetched = await fetchVoices();
+  const [fetched, fetchedBark] = await Promise.all([fetchVoices(), fetchBarkVoices()]);
   allVoices = fetched.length ? fetched : FALLBACK_VOICES;
+  barkVoices = fetchedBark;
 
   populateVoices(langSel.value);
 
   langSel.addEventListener('change', (e) => {
     populateVoices(e.target.value);
   });
+
+  const engineSel = document.getElementById('engine');
+  engineSel.addEventListener('change', updateEngineUI);
+  updateEngineUI();
 
   const speedEl = document.getElementById('speed');
   function updateSpeedBadge() {

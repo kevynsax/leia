@@ -21,12 +21,21 @@
       <div class="card">
         <div class="controls-row">
           <div class="field">
+            <label for="engine"><span data-i18n="engine">Engine</span></label>
+            <div class="select-wrap">
+              <select id="engine">
+                <option value="kokoro">Kokoro</option>
+                <option value="bark">Bark</option>
+              </select>
+            </div>
+          </div>
+          <div class="field" id="language-field">
             <label for="language"><span data-i18n="language">Language</span></label>
             <div class="select-wrap">
               <select id="language"></select>
             </div>
           </div>
-          <div class="field">
+          <div class="field" id="voice-field">
             <label for="voice"><span data-i18n="voice">Voice</span></label>
             <div class="select-wrap">
               <select id="voice"></select>
