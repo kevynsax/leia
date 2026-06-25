@@ -53,6 +53,7 @@ const MODEL_META = {
   kokoro:     { label: 'Kokoro',     style: 'kokoro' },
   chatterbox: { label: 'Chatterbox', style: 'edge' },
   openaudio:  { label: 'OpenAudio',  style: 'flat', requestModel: 'tts-1', voices: OPENAI_VOICES },
+  orpheus:    { label: 'Orpheus',    style: 'flat' },
 };
 let MODELS = [];                // [{ id, label }] discovered at runtime
 
