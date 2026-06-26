@@ -1,12 +1,14 @@
-// Hosts are tried in order, so the first that serves a model wins; later ones
-// are live backups. `provides` pins specific models to a host whose /v1/models
-// vocabulary doesn't match ours (e.g. the OpenAI-style openaudio server);
-// hosts without it are auto-discovered via /v1/models.
+// Every host that serves a model is offered to the user; hosts are listed in
+// preference order, so the first that serves a model is pre-selected and the
+// others become user-selectable alternatives. `provides` pins models to a host
+// whose /v1/models doesn't list them yet (e.g. the OpenAI-style openaudio
+// server); its voices are still discovered live from /v1/audio/voices.
 const TTS_HOSTS = [
-  { url: 'https://tts.kevyn.com.br' },
-  { url: 'https://openaudio-tts.kevyn.com.br', provides: ['openaudio'] },
-  { url: 'https://tts-macbook.kevyn.com.br' },
+  { url: 'https://tts.kevyn.com.br', name: 'Server' },
+  { url: 'https://openaudio-tts.kevyn.com.br', name: 'OpenAudio Server', provides: ['openaudio'] },
+  { url: 'https://tts-macbook.kevyn.com.br', name: 'Kevyn Macbook' },
 ];
+const HOST_NAME = Object.fromEntries(TTS_HOSTS.map(h => [h.url, h.name]));
 const QWENVL_API = 'https://qwenvl.kevyn.com.br';
 const QWENVL_MODEL = 'Qwen/Qwen2.5-VL-7B-Instruct-AWQ';
 const PDF_RENDER_MAX_SIDE = 1200;
@@ -42,20 +44,22 @@ const FILE_PAGE_PROMPT = [
   'Extract only this page. Do not mention the page number.',
 ].join(' ');
 
-const OPENAI_VOICES = ['alloy', 'echo', 'fable', 'onyx', 'nova', 'shimmer'];
-
-// Backends we know how to render, keyed by our model id.
-// `style` picks the voice grouper/name logic:
+// Render hints for models we recognize, keyed by model id. `style` picks the
+// voice grouper/name logic:
 //   'kokoro' → prefix ids (af_…), 'edge' → locale ids (pt-BR-…Neural), 'flat' → plain names.
-// `requestModel` overrides the id sent in the speech request (host vocabulary differs).
-// `voices` pins a fixed voice list for hosts without a /v1/audio/voices endpoint.
+// Any model a host reports that isn't listed here is still offered, defaulting
+// to its server label and the 'edge' voice style.
 const MODEL_META = {
-  kokoro:     { label: 'Kokoro',     style: 'kokoro' },
-  chatterbox: { label: 'Chatterbox', style: 'edge' },
-  openaudio:  { label: 'OpenAudio',  style: 'flat', requestModel: 'tts-1', voices: OPENAI_VOICES },
-  orpheus:    { label: 'Orpheus',    style: 'flat' },
+  kokoro:     { label: 'Kokoro',         style: 'kokoro' },
+  chatterbox: { label: 'Chatterbox',     style: 'edge' },
+  openaudio:  { label: 'OpenAudio',      style: 'edge' },
+  orpheus:    { label: 'Orpheus',        style: 'flat' },
+  higgs:      { label: 'Higgs Audio v2', style: 'edge' },
 };
 let MODELS = [];                // [{ id, label }] discovered at runtime
+
+function modelStyle(id) { return MODEL_META[id]?.style || 'edge'; }
+function modelLabel(id) { return MODEL_META[id]?.label || modelLabels[id] || id; }
 
 // Only en and pt have voices in Kokoro; es is UI-only
 const VOICE_LANGS = [
@@ -66,6 +70,7 @@ const VOICE_LANGS = [
 const T = {
   en: {
     model:        'Model',
+    server:       'Server',
     language:     'Language',
     voice:        'Voice',
     offline:      'This model is offline',
@@ -96,6 +101,7 @@ const T = {
   },
   pt: {
     model:        'Modelo',
+    server:       'Servidor',
     language:     'Idioma',
     voice:        'Voz',
     offline:      'Este modelo está offline',
@@ -126,6 +132,7 @@ const T = {
   },
   es: {
     model:        'Modelo',
+    server:       'Servidor',
     language:     'Idioma',
     voice:        'Voz',
     offline:      'Este modelo está sin conexión',
@@ -175,11 +182,12 @@ const CHATTERBOX_FALLBACK_VOICES = [
 
 const FALLBACK_BY_STYLE = { kokoro: FALLBACK_VOICES, edge: CHATTERBOX_FALLBACK_VOICES };
 
-let modelVoices = {};           // { [id]: string[] } voices fetched per model
-let modelVoiceNames = {};       // { [id]: { [voiceId]: displayName } } from the server
-let modelState = {};            // { [id]: 'loading' | 'ready' | 'offline' }
-let modelHosts = {};            // { [id]: host url currently serving that backend }
+let hostVoices = {};            // { "host\nid": { voices: string[], names: {} } }
+let modelState = {};            // { [id]: 'ready' | 'offline' }
+let modelHostList = {};         // { [id]: string[] } hosts serving the model, in preference order
+let modelLabels = {};           // { [id]: server-provided label }
 let selectedModel = 'kokoro';
+let selectedHost = '';
 let selectedVoice = '';
 let wavesurfer = null;
 let audioBlob = null;
@@ -552,37 +560,32 @@ async function handleUpload(file) {
 
 // ── Backend discovery ─────────────────────────────────────────────
 
-// Resolve which of our models a host serves. `provides` hosts are taken at their
-// word once reachable; others are auto-discovered from /v1/models.
+// Resolve which models a host serves. `provides` hosts are taken at their word
+// once reachable; others are read straight from /v1/models (every model offered).
 async function probeHost(host) {
   try {
     const res = await fetch(`${host.url}/v1/models`, { cache: 'no-store' });
     if (!res.ok) return [];
-    if (host.provides) return host.provides;
+    if (host.provides) return host.provides.map(id => ({ id }));
     const j = await res.json();
-    const ids = Array.isArray(j.data) ? j.data.map(m => m.id) : [];
-    return ids.filter(id => MODEL_META[id]);
+    return Array.isArray(j.data) ? j.data.filter(m => m && m.id) : [];
   } catch {
     return [];
   }
 }
 
-// Probe every host and map each serveable model to a host url. Hosts are tried in
-// order, so the first one wins when several serve the same model; the others then
-// act as live backups discovered on the next probe. Models pinned to a `provides`
-// host are never auto-claimed elsewhere, since their request/voice vocabulary is
-// host-specific.
+// Probe every host and list, per model, the hosts that serve it. Hosts keep their
+// TTS_HOSTS order, so the first host serving a model is its default and the rest
+// are user-selectable alternatives. Server-provided labels are cached along the way.
 async function discoverHosts() {
-  const pinned = new Set(TTS_HOSTS.flatMap(h => h.provides || []));
   const probed = await Promise.all(
-    TTS_HOSTS.map(async host => ({ host, ids: await probeHost(host) }))
+    TTS_HOSTS.map(async host => ({ host, models: await probeHost(host) }))
   );
   const map = {};
-  for (const { host, ids } of probed) {
-    for (const id of ids) {
-      if (!MODEL_META[id] || map[id]) continue;
-      if (pinned.has(id) && !(host.provides || []).includes(id)) continue;
-      map[id] = host.url;
+  for (const { host, models } of probed) {
+    for (const m of models) {
+      if (m.label) modelLabels[m.id] = m.label;
+      (map[m.id] ||= []).push(host.url);
     }
   }
   return map;
@@ -603,16 +606,27 @@ async function fetchModelVoices(host, id) {
   }
 }
 
-// Server-supplied display name for a voice id on the active model, if any.
-function displayNameFor(voiceId) {
-  return modelVoiceNames[selectedModel]?.[voiceId];
+function voiceKey(host, id) { return `${host}\n${id}`; }
+
+// Voices/names are host-specific (the same model exposes different voices per
+// host), so fetch and cache them per host+model.
+async function ensureVoices(host, id) {
+  const key = voiceKey(host, id);
+  if (hostVoices[key]) return hostVoices[key];
+  const { voices, names } = await fetchModelVoices(host, id);
+  hostVoices[key] = {
+    voices: voices.length ? voices : (FALLBACK_BY_STYLE[modelStyle(id)] || []),
+    names,
+  };
+  return hostVoices[key];
 }
 
-// Resolve the host serving a backend, re-probing if the cached one is gone.
-async function hostForModel(id) {
-  if (modelHosts[id]) return modelHosts[id];
-  modelHosts = await discoverHosts();
-  return modelHosts[id] || null;
+function currentVoices() { return hostVoices[voiceKey(selectedHost, selectedModel)]?.voices || []; }
+function currentNames() { return hostVoices[voiceKey(selectedHost, selectedModel)]?.names || {}; }
+
+// Server-supplied display name for a voice id on the selected host+model, if any.
+function displayNameFor(voiceId) {
+  return currentNames()[voiceId];
 }
 
 // ── Populate UI ───────────────────────────────────────────────────
@@ -731,8 +745,8 @@ function edgeVoiceGroups(voiceLangId, allVoices) {
 }
 
 function voiceGroupsForModel() {
-  const style = MODEL_META[selectedModel]?.style;
-  const voices = modelVoices[selectedModel] || [];
+  const style = modelStyle(selectedModel);
+  const voices = currentVoices();
   if (style === 'flat') return flatVoiceGroups(voices);
   const voiceLangId = document.getElementById('language').value;
   if (style === 'edge') return edgeVoiceGroups(voiceLangId, voices);
@@ -816,29 +830,68 @@ function renderModelChips() {
   });
 }
 
+// Show the host picker only when a model is served by more than one host.
+function renderServerChips() {
+  const field = document.getElementById('server-field');
+  const wrap = document.getElementById('server-chips');
+  const hosts = modelHostList[selectedModel] || [];
+  wrap.innerHTML = '';
+
+  if (hosts.length <= 1) { field.hidden = true; return; }
+  field.hidden = false;
+  hosts.forEach(url => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'model-chip' + (url === selectedHost ? ' is-selected' : '');
+    btn.textContent = HOST_NAME[url] || url;
+    btn.addEventListener('click', () => setHost(url));
+    wrap.appendChild(btn);
+  });
+}
+
+function setHost(url) {
+  if (url === selectedHost) return;
+  selectedHost = url;
+  selectedVoice = '';
+  renderServerChips();
+  refreshVoices();
+}
+
+async function refreshVoices() {
+  const grid = document.getElementById('voice-grid');
+  if (!selectedHost) { renderVoiceGrid(); return; }
+  const host = selectedHost, id = selectedModel;
+  grid.innerHTML = `<p class="voice-hint">${t.loadingVoices}</p>`;
+  await ensureVoices(host, id);
+  if (host === selectedHost && id === selectedModel) renderVoiceGrid();
+}
+
 function setModel(id) {
   selectedModel = id;
   selectedVoice = '';
+  selectedHost = (modelHostList[id] || [])[0] || '';
   document.querySelectorAll('#model-chips .model-chip').forEach((b, i) =>
     b.classList.toggle('is-selected', MODELS[i] && MODELS[i].id === id));
 
-  // Flat-style models (e.g. openaudio) have language-agnostic voices.
-  const hideLang = MODEL_META[id]?.style === 'flat';
+  renderServerChips();
+
+  // Flat-style models (e.g. orpheus) have language-agnostic voices.
+  const hideLang = modelStyle(id) === 'flat';
   const langField = document.getElementById('language-field');
   if (langField) langField.style.display = hideLang ? 'none' : '';
 
-  renderVoiceGrid();
+  refreshVoices();
 }
 
 function speechBody(engine, text, voice, speed, language) {
   const body = {
-    model:           MODEL_META[engine]?.requestModel || engine,
+    model:           engine,
     input:           text,
     voice:           voice,
     response_format: 'mp3',
     speed:           speed,
   };
-  if (MODEL_META[engine]?.style === 'edge') body.language = language;
+  if (modelStyle(engine) === 'edge') body.language = language;
   return body;
 }
 
@@ -857,20 +910,26 @@ async function requestSpeech(host, engine, text, voice, speed, language) {
   return res.blob();
 }
 
-// Synthesize on the host serving this backend; if it has gone away, re-probe and
-// retry once on whichever host now serves it (the backup).
+// Synthesize on the selected host; if it fails, fall back to the model's other
+// hosts in preference order (re-probing once if none are known).
 async function generateSpeech(engine, text, voice, speed, language) {
-  let host = await hostForModel(engine);
-  if (!host) throw new Error(t.offlineDesc);
-
-  try {
-    return await requestSpeech(host, engine, text, voice, speed, language);
-  } catch (err) {
-    modelHosts = await discoverHosts();
-    const backup = modelHosts[engine];
-    if (!backup || backup === host) throw err;
-    return requestSpeech(backup, engine, text, voice, speed, language);
+  let hosts = [selectedHost, ...(modelHostList[engine] || [])].filter(Boolean);
+  if (!hosts.length) {
+    modelHostList = await discoverHosts();
+    hosts = modelHostList[engine] || [];
   }
+  hosts = [...new Set(hosts)];
+  if (!hosts.length) throw new Error(t.offlineDesc);
+
+  let lastErr;
+  for (const host of hosts) {
+    try {
+      return await requestSpeech(host, engine, text, voice, speed, language);
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr || new Error(t.offlineDesc);
 }
 
 // ── Generate ──────────────────────────────────────────────────────
@@ -908,13 +967,13 @@ async function generate() {
     if (audioObjectUrl) URL.revokeObjectURL(audioObjectUrl);
     audioObjectUrl = URL.createObjectURL(audioBlob);
 
-    const style = MODEL_META[engine]?.style;
-    const voiceName = modelVoiceNames[engine]?.[voice]
+    const style = modelStyle(engine);
+    const voiceName = currentNames()[voice]
       ?? (style === 'edge' ? edgeVoiceName(voice)
         : style === 'flat' ? capFirst(voice)
         : voiceDisplayName(voice));
     const langLabel = style === 'flat'
-      ? (MODEL_META[engine]?.label ?? '')
+      ? modelLabel(engine)
       : (t.voiceLabels[language] ?? '');
 
     const out = document.getElementById('output-section');
@@ -968,20 +1027,15 @@ async function init() {
   document.getElementById('voice-grid').innerHTML =
     `<p class="voice-hint">${t.loadingVoices}</p>`;
 
-  modelHosts = await discoverHosts();
+  modelLabels = {};
+  hostVoices = {};
+  modelHostList = await discoverHosts();
 
-  modelVoices = {};
-  modelVoiceNames = {};
-  await Promise.all(Object.keys(modelHosts).map(async id => {
-    if (MODEL_META[id].voices) { modelVoices[id] = MODEL_META[id].voices; return; }
-    const { voices, names } = await fetchModelVoices(modelHosts[id], id);
-    modelVoices[id] = voices.length ? voices : (FALLBACK_BY_STYLE[MODEL_META[id].style] || []);
-    modelVoiceNames[id] = names || {};
-  }));
-
-  MODELS = Object.keys(MODEL_META)
-    .filter(id => modelHosts[id])
-    .map(id => ({ id, label: MODEL_META[id].label }));
+  const hasHost = id => (modelHostList[id] || []).length > 0;
+  MODELS = [
+    ...Object.keys(MODEL_META).filter(hasHost),
+    ...Object.keys(modelHostList).filter(id => !MODEL_META[id] && hasHost(id)),
+  ].map(id => ({ id, label: modelLabel(id) }));
   modelState = Object.fromEntries(MODELS.map(m => [m.id, 'ready']));
   renderModelChips();
 
