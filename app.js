@@ -176,6 +176,7 @@ const CHATTERBOX_FALLBACK_VOICES = [
 const FALLBACK_BY_STYLE = { kokoro: FALLBACK_VOICES, edge: CHATTERBOX_FALLBACK_VOICES };
 
 let modelVoices = {};           // { [id]: string[] } voices fetched per model
+let modelVoiceNames = {};       // { [id]: { [voiceId]: displayName } } from the server
 let modelState = {};            // { [id]: 'loading' | 'ready' | 'offline' }
 let modelHosts = {};            // { [id]: host url currently serving that backend }
 let selectedModel = 'kokoro';
@@ -591,12 +592,20 @@ async function discoverHosts() {
 async function fetchModelVoices(host, id) {
   try {
     const res = await fetch(`${host}/v1/audio/voices?model=${encodeURIComponent(id)}`, { cache: 'no-store' });
-    if (!res.ok) return [];
+    if (!res.ok) return { voices: [], names: {} };
     const j = await res.json();
-    return Array.isArray(j.voices) ? j.voices : [];
+    return {
+      voices: Array.isArray(j.voices) ? j.voices : [],
+      names: (j.names && typeof j.names === 'object') ? j.names : {},
+    };
   } catch {
-    return [];
+    return { voices: [], names: {} };
   }
+}
+
+// Server-supplied display name for a voice id on the active model, if any.
+function displayNameFor(voiceId) {
+  return modelVoiceNames[selectedModel]?.[voiceId];
 }
 
 // Resolve the host serving a backend, re-probing if the cached one is gone.
@@ -624,7 +633,7 @@ function kokoroVoiceGroups(voiceLangId, voices) {
 
   const byPfx = pfx => voices
     .filter(v => pfx.some(p => v.startsWith(p + '_')))
-    .map(v => ({ id: v, name: voiceDisplayName(v) }));
+    .map(v => ({ id: v, name: displayNameFor(v) ?? voiceDisplayName(v) }));
 
   return [
     { label: t.genderF, voices: byPfx(fPfx) },
@@ -704,7 +713,7 @@ function edgeVoiceName(voiceId) {
 
 // Flat, language-agnostic voice names (e.g. "alloy"), used by openaudio.
 function flatVoiceGroups(voices) {
-  return [{ label: t.voice, voices: voices.map(v => ({ id: v, name: capFirst(v) })) }];
+  return [{ label: t.voice, voices: voices.map(v => ({ id: v, name: displayNameFor(v) ?? capFirst(v) })) }];
 }
 
 function edgeVoiceGroups(voiceLangId, allVoices) {
@@ -717,7 +726,7 @@ function edgeVoiceGroups(voiceLangId, allVoices) {
 
   return Object.keys(groups).sort().map(region => ({
     label: region,
-    voices: groups[region].map(v => ({ id: v, name: edgeVoiceName(v) })),
+    voices: groups[region].map(v => ({ id: v, name: displayNameFor(v) ?? edgeVoiceName(v) })),
   }));
 }
 
@@ -900,9 +909,10 @@ async function generate() {
     audioObjectUrl = URL.createObjectURL(audioBlob);
 
     const style = MODEL_META[engine]?.style;
-    const voiceName = style === 'edge' ? edgeVoiceName(voice)
-      : style === 'flat' ? capFirst(voice)
-      : voiceDisplayName(voice);
+    const voiceName = modelVoiceNames[engine]?.[voice]
+      ?? (style === 'edge' ? edgeVoiceName(voice)
+        : style === 'flat' ? capFirst(voice)
+        : voiceDisplayName(voice));
     const langLabel = style === 'flat'
       ? (MODEL_META[engine]?.label ?? '')
       : (t.voiceLabels[language] ?? '');
@@ -961,10 +971,12 @@ async function init() {
   modelHosts = await discoverHosts();
 
   modelVoices = {};
+  modelVoiceNames = {};
   await Promise.all(Object.keys(modelHosts).map(async id => {
     if (MODEL_META[id].voices) { modelVoices[id] = MODEL_META[id].voices; return; }
-    const voices = await fetchModelVoices(modelHosts[id], id);
+    const { voices, names } = await fetchModelVoices(modelHosts[id], id);
     modelVoices[id] = voices.length ? voices : (FALLBACK_BY_STYLE[MODEL_META[id].style] || []);
+    modelVoiceNames[id] = names || {};
   }));
 
   MODELS = Object.keys(MODEL_META)
